@@ -30,6 +30,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/traces/{trace_id}` | 按编号查询完整追迹（含各段交点与方向） |
 | GET | `/api/traces/{trace_id}/segments/{seg_index}` | 按编号查询某一段的交点与方向 |
 | POST | `/api/beam-evaluations` | 扇形采样多条光线逐条追迹，返回各光线发射角、状态、观察线交点及质心/RMS（不入库） |
+| POST | `/api/power-evaluations` | 扇形采样并按菲涅耳公式逐界面累乘 s/p 透射率，返回逐光线透过率、交点、总入射功率、有效功率与功率加权质心（不入库） |
 | POST | `/api/aim-solutions` | 扫描发射角并对偏差异号区间二分，求解命中观察线目标偏移量的光线（不入库） |
 
 ### 请求示例
@@ -127,6 +128,78 @@ curl -X POST http://localhost:8000/api/beam-evaluations \
 - `rays[]` 按发射角从 `-a` 到 `+a` 排列，每条含 `emission_angle_deg`（相对中心方向的发射角，度）、`direction`（归一化后的实际发射方向）、`status` / `reason`（复用单光线追迹的状态与停止原因）、`observation_point`（观察线前向交点，无效时为 `null`）。
 - 无任何命中时：`hit_count` 为 0，`centroid` 与 `rms_radius` 均为 `null`。
 
+## 功率评估
+
+`POST /api/power-evaluations` 在光束请求（起点、中心方向、折射率、顺序界面、观察线、半角、采样数）的基础上增加 `s_fraction`（0～1，s 偏振入射功率占比，p 偏振占 `1 - s_fraction`），复用同一套扇形采样与追迹逻辑，并按**菲涅耳公式**逐界面计算 s/p 功率透射率。该接口为即时计算，结果不写入数据库。
+
+- 每条光线**入射功率归一为 1**：s 分量 `s_fraction`、p 分量 `1 - s_fraction`。
+- 每个界面以入射方向与（指向入射侧的）法线求入射角、折射角余弦 `cos_i`、`cos_t`：
+  - `Rs = [(n1·cos_i − n2·cos_t)/(n1·cos_i + n2·cos_t)]²`
+  - `Rp = [(n2·cos_i − n1·cos_t)/(n2·cos_i + n1·cos_t)]²`
+  - s/p 的功率透射率分别按 `1 − R` 逐界面累乘（界面无吸收）。
+- **全反射**（该界面透射率为 0）或**漏过界面**（平行 / 交点在反方向）时光线的 s/p 透射率均记 `0`，`observation_point` 为 `null`。
+- 仅追迹 `completed` 且与观察线存在**前向**交点的光线计入**有效功率**：该光线的透射功率为 `s_fraction·T_s + (1−s_fraction)·T_p`；有效功率为所有命中光线透射功率之和，**功率加权质心**为 `Σ(功率·交点)/Σ功率`。有效功率为零时 `weighted_centroid` 为 `null`。
+- `total_incident_power` 为全部采样光线的入射功率之和，即光线数（每条 1）。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/power-evaluations` | 扇形采样、菲涅耳 s/p 透射率逐界面累乘，返回逐光线透过率与交点、总/有效功率及功率加权质心 |
+
+### 功率评估请求示例
+
+```bash
+curl -X POST http://localhost:8000/api/power-evaluations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": {"x": 0, "y": 0},
+    "center_direction": {"x": 1, "y": 0},
+    "half_angle_deg": 10,
+    "sample_count": 21,
+    "n_start": 1.0,
+    "interfaces": [
+      {"point": {"x": 2, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.5},
+      {"point": {"x": 4, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.0}
+    ],
+    "observation_line": {"point": {"x": 10, "y": 0}, "normal": {"x": 1, "y": 0}},
+    "s_fraction": 0.5
+  }'
+```
+
+### 功率评估响应说明
+
+```json
+{
+  "half_angle_deg": 10.0,
+  "sample_count": 21,
+  "s_fraction": 0.5,
+  "ray_count": 21,
+  "total_incident_power": 21.0,
+  "effective_power": 19.353464,
+  "weighted_centroid": {"x": 10.0, "y": 0.0},
+  "rays": [
+    {
+      "emission_angle_deg": -10.0,
+      "direction": {"x": 0.984807753012208, "y": -0.17364817766693033},
+      "status": "completed",
+      "reason": null,
+      "transmittance_s": 0.918416539493318,
+      "transmittance_p": 0.9247294040133414,
+      "transmitted_power": 0.9215729717533296,
+      "observation_point": {"x": 10.0, "y": -1.6437139662827691}
+    }
+  ]
+}
+```
+
+- `total_incident_power`：总入射功率，等于 `ray_count`（每条光线入射功率 1）。
+- `effective_power`：有效功率，仅累加追迹完成且与观察线有前向交点的光线。
+- `weighted_centroid`：功率加权质心；有效功率为零时为 `null`。
+- `rays[]` 按发射角从 `-a` 到 `+a` 排列，每条含：
+  - `transmittance_s` / `transmittance_p`：穿过全部界面后 s/p 偏振的累积功率透射率（逐界面 `∏(1−R)`；全反射或漏过界面时为 `0`）；
+  - `transmitted_power`：该光线计入有效功率的混合透射功率 `s_fraction·T_s + (1−s_fraction)·T_p`（无有效观察线交点时为 `0`）；
+  - 其余字段（`emission_angle_deg`、`direction`、`status` / `reason`、`observation_point`）含义与光束评估一致。
+- `s_fraction` 取 `0` / `1` 时分别为纯 p / 纯 s 偏振。
+
 ## 瞄准求解
 
 `POST /api/aim-solutions` 在光束请求（起点、中心方向、折射率、顺序界面、观察线、半角、采样数）的基础上增加 `target_offset`（目标偏移量），求解使出射光线命中观察线上目标位置的发射角。该接口为即时计算，结果不写入数据库。
@@ -186,7 +259,7 @@ curl -X POST http://localhost:8000/api/aim-solutions \
 ```
 app/
   main.py       FastAPI 路由与生命周期（启动时建库）
-  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS 与瞄准求解（扫描+二分）
+  geometry.py   二维求交、斯涅尔折射、菲涅耳 s/p 透射率、方向采样、光斑质心/RMS、功率加权质心与瞄准求解（扫描+二分）
   db.py         SQLite 持久化（traces / segments 两表）
   schemas.py    Pydantic 请求 / 响应模型
 Dockerfile

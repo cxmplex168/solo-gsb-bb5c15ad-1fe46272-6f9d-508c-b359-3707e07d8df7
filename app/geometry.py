@@ -62,10 +62,12 @@ def _refract(
     normal: tuple[float, float],
     n1: float,
     n2: float,
-) -> tuple[float, float] | None:
+) -> tuple[tuple[float, float], float, float] | None:
     """按斯涅尔定律计算折射方向；发生全反射时返回 None。
 
     若光线从法线背面入射，则翻转法线再计算（折射率仍按给定 n1 -> n2）。
+    正常折射时返回 (new_direction, cos_i, cos_t)，两个余弦均相对于实际入射侧
+    法线取非负值，供菲涅耳公式使用。
     """
     cos_i = _dot(direction, normal)
     if cos_i < 0.0:
@@ -77,7 +79,30 @@ def _refract(
         return None  # 全反射
     cos_t = math.sqrt(1.0 - sin2_t)
     k = cos_t - eta * cos_i
-    return (eta * direction[0] + k * normal[0], eta * direction[1] + k * normal[1])
+    new_direction = (
+        eta * direction[0] + k * normal[0],
+        eta * direction[1] + k * normal[1],
+    )
+    return new_direction, cos_i, cos_t
+
+
+def fresnel_transmittance(
+    cos_i: float,
+    cos_t: float,
+    n1: float,
+    n2: float,
+) -> tuple[float, float]:
+    """单界面 s/p 偏振的功率透射率 1-R（界面无吸收）。
+
+    Rs = [(n1 cos_i - n2 cos_t)/(n1 cos_i + n2 cos_t)]²
+    Rp = [(n2 cos_i - n1 cos_t)/(n2 cos_i + n1 cos_t)]²
+    结果裁剪到 [0, 1]，避免掠入射时的浮点误差。
+    """
+    r_s = ((n1 * cos_i - n2 * cos_t) / (n1 * cos_i + n2 * cos_t)) ** 2
+    r_p = ((n2 * cos_i - n1 * cos_t) / (n2 * cos_i + n1 * cos_t)) ** 2
+    t_s = min(1.0, max(0.0, 1.0 - r_s))
+    t_p = min(1.0, max(0.0, 1.0 - r_p))
+    return t_s, t_p
 
 
 def sample_directions(
@@ -133,6 +158,74 @@ def centroid_and_rms(
     return (cx, cy), math.sqrt(mean_sq)
 
 
+def weighted_centroid(
+    weighted_points: list[tuple[tuple[float, float], float]],
+) -> tuple[float, float] | None:
+    """以权重对各点做功率加权质心 Σ(w·p)/Σw；总权重为 0（或空集）时返回 None。"""
+    total_w = sum(w for _, w in weighted_points)
+    if total_w <= EPS:
+        return None
+    cx = sum(w * p[0] for p, w in weighted_points) / total_w
+    cy = sum(w * p[1] for p, w in weighted_points) / total_w
+    return cx, cy
+
+
+def _trace(
+    start: tuple[float, float],
+    direction: tuple[float, float],
+    n_start: float,
+    interfaces: list[tuple[tuple[float, float], tuple[float, float], float]],
+) -> tuple[list[SegmentResult], str, str | None, float, float]:
+    """依次对每个界面做前向求交并折射，同时累乘 s/p 偏振功率透射率。
+
+    interfaces: 按顺序排列的 (point, normal, n_next)。
+    返回 (segments, status, reason, T_s, T_p)，status ∈
+    completed / total_internal_reflection / no_intersection；
+    T_s、T_p 为已穿过界面的 ∏(1-R)，全反射（该界面 T=0）或漏过界面时为 0。
+    """
+    origin = (float(start[0]), float(start[1]))
+    d = normalize(direction)
+    n_current = float(n_start)
+    segments: list[SegmentResult] = []
+    t_s_total = 1.0
+    t_p_total = 1.0
+
+    for idx, (point, normal, n_next) in enumerate(interfaces):
+        nrm = normalize(normal)
+        hit = _intersect_line(origin, d, point, nrm)
+        if hit is None:
+            reason = (
+                f"光线与第 {idx} 个界面平行，或交点位于光线反方向，追迹停止"
+            )
+            segments.append(SegmentResult(origin, d, n_current, None, "no_intersection", None))
+            return segments, "no_intersection", reason, 0.0, 0.0
+
+        refracted = _refract(d, nrm, n_current, n_next)
+        if refracted is None:
+            reason = (
+                f"在第 {idx} 个界面发生全反射：n1={n_current} -> n2={n_next}，"
+                f"入射角超过临界角，追迹停止"
+            )
+            segments.append(
+                SegmentResult(origin, d, n_current, hit, "total_internal_reflection", n_next)
+            )
+            # 全反射界面透射率为 0：无功率到达出射段
+            return segments, "total_internal_reflection", reason, 0.0, 0.0
+
+        new_dir, cos_i, cos_t = refracted
+        t_s, t_p = fresnel_transmittance(cos_i, cos_t, n_current, n_next)
+        t_s_total *= t_s
+        t_p_total *= t_p
+        segments.append(SegmentResult(origin, d, n_current, hit, "refraction", n_next))
+        origin = hit
+        d = new_dir
+        n_current = n_next
+
+    # 穿过所有界面，最后一段出射
+    segments.append(SegmentResult(origin, d, n_current, None, None, None))
+    return segments, "completed", None, t_s_total, t_p_total
+
+
 def trace_ray(
     start: tuple[float, float],
     direction: tuple[float, float],
@@ -145,40 +238,23 @@ def trace_ray(
     返回 (segments, status, reason)，status ∈
     completed / total_internal_reflection / no_intersection。
     """
-    origin = (float(start[0]), float(start[1]))
-    d = normalize(direction)
-    n_current = float(n_start)
-    segments: list[SegmentResult] = []
+    segments, status, reason, _, _ = _trace(start, direction, n_start, interfaces)
+    return segments, status, reason
 
-    for idx, (point, normal, n_next) in enumerate(interfaces):
-        nrm = normalize(normal)
-        hit = _intersect_line(origin, d, point, nrm)
-        if hit is None:
-            reason = (
-                f"光线与第 {idx} 个界面平行，或交点位于光线反方向，追迹停止"
-            )
-            segments.append(SegmentResult(origin, d, n_current, None, "no_intersection", None))
-            return segments, "no_intersection", reason
 
-        new_dir = _refract(d, nrm, n_current, n_next)
-        if new_dir is None:
-            reason = (
-                f"在第 {idx} 个界面发生全反射：n1={n_current} -> n2={n_next}，"
-                f"入射角超过临界角，追迹停止"
-            )
-            segments.append(
-                SegmentResult(origin, d, n_current, hit, "total_internal_reflection", n_next)
-            )
-            return segments, "total_internal_reflection", reason
+def trace_ray_polarized(
+    start: tuple[float, float],
+    direction: tuple[float, float],
+    n_start: float,
+    interfaces: list[tuple[tuple[float, float], tuple[float, float], float]],
+) -> tuple[list[SegmentResult], str, str | None, float, float]:
+    """同 trace_ray，并额外返回穿过各界面后 s/p 偏振的累积功率透射率。
 
-        segments.append(SegmentResult(origin, d, n_current, hit, "refraction", n_next))
-        origin = hit
-        d = new_dir
-        n_current = n_next
-
-    # 穿过所有界面，最后一段出射
-    segments.append(SegmentResult(origin, d, n_current, None, None, None))
-    return segments, "completed", None
+    返回 (segments, status, reason, transmittance_s, transmittance_p)；
+    每条光线入射功率归一为 1，全反射或漏过界面时该光线无功率到达出射段，
+    两个透射率均为 0。
+    """
+    return _trace(start, direction, n_start, interfaces)
 
 
 def aim_solutions(

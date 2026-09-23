@@ -6,6 +6,9 @@ GET  /api/traces/{trace_id}           按编号查询完整追迹（含各段交
 GET  /api/traces/{trace_id}/segments/{seg_index}  按编号查询某一段
 POST /api/beam-evaluations            以中心方向为轴对称采样多条光线，返回每条光线
                                       的发射角、追迹状态、观察线交点及质心/RMS 半径
+POST /api/power-evaluations           同样扇形采样并追迹，按菲涅耳公式逐界面累乘
+                                      s/p 透射率，返回逐光线透过率、有效功率与
+                                      功率加权质心（不入库）
 POST /api/aim-solutions               在半角范围内扫描发射角并对偏差异号区间二分，
                                       求解命中观察线目标偏移量的光线，返回角度、
                                       出射方向、观察线交点与目标偏差（不入库）
@@ -23,12 +26,16 @@ from .geometry import (
     observation_intersection,
     sample_directions,
     trace_ray,
+    trace_ray_polarized,
+    weighted_centroid,
 )
 from .schemas import (
     AimRequest,
     AimSolutionOut,
     BeamEvaluationOut,
     BeamRequest,
+    PowerEvaluationOut,
+    PowerRequest,
     SegmentOut,
     TraceOut,
     TraceRequest,
@@ -150,6 +157,80 @@ def evaluate_beam(req: BeamRequest) -> dict:
         "hit_count": len(hit_points),
         "centroid": None if stats is None else {"x": stats[0][0], "y": stats[0][1]},
         "rms_radius": None if stats is None else stats[1],
+        "rays": rays_out,
+    }
+
+
+@app.post("/api/power-evaluations", response_model=PowerEvaluationOut)
+def evaluate_power(req: PowerRequest) -> dict:
+    """扇形采样并逐条追迹，按菲涅耳公式逐界面累乘 s/p 功率透射率并评估光斑功率。
+
+    每条光线入射功率归一为 1，其中 s 偏振占 s_fraction、p 偏振占 1-s_fraction；
+    各界面以入射方向与法线求 cos_i、cos_t：
+    Rs=[(n1 cos_i-n2 cos_t)/(n1 cos_i+n2 cos_t)]²、
+    Rp=[(n2 cos_i-n1 cos_t)/(n2 cos_i+n1 cos_t)]²，
+    s/p 透射率分别逐界面累乘 (1-R)。全反射或漏过界面的光线透射功率记零。
+
+    仅追迹完成（status=completed）且与观察线存在前向交点的光线计入有效功率；
+    有效功率为这些光线混合透射功率 s_fraction·T_s+(1-s_fraction)·T_p 之和，
+    加权质心以该功率对交点加权；有效功率为零时 weighted_centroid 为 null。
+    """
+    interfaces = [
+        (itf.point.as_tuple(), itf.normal.as_tuple(), itf.n_next)
+        for itf in req.interfaces
+    ]
+    start = req.start.as_tuple()
+    p_fraction = 1.0 - req.s_fraction
+
+    rays_out: list[dict] = []
+    weighted_points: list[tuple[tuple[float, float], float]] = []
+    effective_power = 0.0
+    for angle, direction in sample_directions(
+        req.center_direction.as_tuple(), req.half_angle_deg, req.sample_count
+    ):
+        segments, status, reason, t_s, t_p = trace_ray_polarized(
+            start, direction, req.n_start, interfaces
+        )
+        observation_point = None
+        transmitted_power = 0.0
+        if status == "completed":
+            observation_point = observation_intersection(
+                segments,
+                req.observation_line.point.as_tuple(),
+                req.observation_line.normal.as_tuple(),
+            )
+            if observation_point is not None:
+                transmitted_power = req.s_fraction * t_s + p_fraction * t_p
+                effective_power += transmitted_power
+                weighted_points.append((observation_point, transmitted_power))
+        rays_out.append(
+            {
+                "emission_angle_deg": angle,
+                "direction": {"x": direction[0], "y": direction[1]},
+                "status": status,
+                "reason": reason,
+                "transmittance_s": t_s,
+                "transmittance_p": t_p,
+                "transmitted_power": transmitted_power,
+                "observation_point": (
+                    None
+                    if observation_point is None
+                    else {"x": observation_point[0], "y": observation_point[1]}
+                ),
+            }
+        )
+
+    centroid = weighted_centroid(weighted_points)
+    return {
+        "half_angle_deg": req.half_angle_deg,
+        "sample_count": req.sample_count,
+        "s_fraction": req.s_fraction,
+        "ray_count": len(rays_out),
+        "total_incident_power": float(len(rays_out)),
+        "effective_power": effective_power,
+        "weighted_centroid": (
+            None if centroid is None else {"x": centroid[0], "y": centroid[1]}
+        ),
         "rays": rays_out,
     }
 
