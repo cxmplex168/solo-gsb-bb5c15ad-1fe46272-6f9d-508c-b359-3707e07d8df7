@@ -123,6 +123,38 @@ class BeamEvaluationOut(BaseModel):
     rays: list[BeamRayOut]
 
 
+class PowerRequest(BeamRequest):
+    """功率评估请求：在光束请求基础上增加 s 偏振入射功率占比。
+
+    每条光线入射功率为 1，其中 s 偏振占 s_fraction、p 偏振占 1 - s_fraction。
+    """
+
+    s_fraction: float = Field(ge=0, le=1, description="s 偏振入射功率占比，取值 0～1")
+
+
+class PowerRayOut(BaseModel):
+    emission_angle_deg: float
+    direction: Vec2
+    status: str
+    reason: str | None
+    transmittance_s: float
+    transmittance_p: float
+    power: float
+    observation_point: Vec2 | None
+
+
+class PowerEvaluationOut(BaseModel):
+    half_angle_deg: float
+    sample_count: int
+    s_fraction: float
+    ray_count: int
+    hit_count: int
+    total_input_power: float
+    effective_power: float
+    weighted_centroid: Vec2 | None
+    rays: list[PowerRayOut]
+
+
 class AimRequest(BeamRequest):
     """瞄准求解请求：在光束请求基础上增加目标偏移量。
 

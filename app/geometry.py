@@ -80,6 +80,59 @@ def _refract(
     return (eta * direction[0] + k * normal[0], eta * direction[1] + k * normal[1])
 
 
+def fresnel_transmittance(
+    direction: tuple[float, float],
+    normal: tuple[float, float],
+    n1: float,
+    n2: float,
+) -> tuple[float, float, float, float] | None:
+    """单界面菲涅耳 s/p 功率透过率（忽略吸收，T = 1 - R）。
+
+    以光线方向与界面法线求入射角余弦 cos_i（光线从法线背面入射时翻转法线），
+    再由斯涅尔定律 sin_t = (n1/n2) sin_i 求折射角余弦 cos_t：
+        Rs = [(n1 cos_i - n2 cos_t)/(n1 cos_i + n2 cos_t)]²
+        Rp = [(n2 cos_i - n1 cos_t)/(n2 cos_i + n1 cos_t)]²
+    发生全反射（sin²t > 1）时返回 None。
+    返回 (cos_i, cos_t, 1 - Rs, 1 - Rp)。
+    """
+    nrm = normalize(normal)
+    cos_i = _dot(direction, nrm)
+    if cos_i < 0.0:
+        nrm = (-nrm[0], -nrm[1])
+        cos_i = -cos_i
+    eta = n1 / n2
+    sin2_t = eta * eta * max(0.0, 1.0 - cos_i * cos_i)
+    if sin2_t > 1.0:
+        return None  # 全反射
+    cos_t = math.sqrt(max(0.0, 1.0 - sin2_t))
+    r_s = (n1 * cos_i - n2 * cos_t) / (n1 * cos_i + n2 * cos_t)
+    r_p = (n2 * cos_i - n1 * cos_t) / (n2 * cos_i + n1 * cos_t)
+    return cos_i, cos_t, 1.0 - r_s * r_s, 1.0 - r_p * r_p
+
+
+def ray_transmittance(
+    segments: list[SegmentResult],
+    status: str,
+    interfaces: list[tuple[tuple[float, float], tuple[float, float], float]],
+) -> tuple[float, float]:
+    """对一条已追迹光线逐界面累乘 s/p 功率透过率（各界面 T = 1 - R）。
+
+    复用 trace_ray 的结果：仅对 status=completed 的光线，按界面对应顺序取
+    各折射段的入射方向与界面法线计算菲涅耳反射率；全反射或中途漏过界面
+    （status 非 completed）时整条光线透过率记 0。无界面时透过率为 (1, 1)。
+    """
+    if status != "completed":
+        return 0.0, 0.0
+    t_s, t_p = 1.0, 1.0
+    for seg, (_point, normal, n_next) in zip(segments, interfaces):
+        fresnel = fresnel_transmittance(seg.direction, normal, seg.n_medium, n_next)
+        if fresnel is None:
+            return 0.0, 0.0  # 全反射：零功率
+        t_s *= fresnel[2]
+        t_p *= fresnel[3]
+    return t_s, t_p
+
+
 def sample_directions(
     center: tuple[float, float],
     half_angle_deg: float,
@@ -131,6 +184,18 @@ def centroid_and_rms(
     cy = sum(p[1] for p in points) / count
     mean_sq = sum((p[0] - cx) ** 2 + (p[1] - cy) ** 2 for p in points) / count
     return (cx, cy), math.sqrt(mean_sq)
+
+
+def weighted_centroid(
+    points: list[tuple[tuple[float, float], float]],
+) -> tuple[float, float] | None:
+    """功率加权质心：sum(w·p)/sum(w)；权重总和为 0（或空集）时返回 None。"""
+    total = sum(w for _p, w in points)
+    if total <= EPS:
+        return None
+    cx = sum(w * p[0] for p, w in points) / total
+    cy = sum(w * p[1] for p, w in points) / total
+    return (cx, cy)
 
 
 def trace_ray(

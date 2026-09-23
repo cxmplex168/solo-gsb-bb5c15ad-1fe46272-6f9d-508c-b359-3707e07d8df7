@@ -30,6 +30,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/traces/{trace_id}` | 按编号查询完整追迹（含各段交点与方向） |
 | GET | `/api/traces/{trace_id}/segments/{seg_index}` | 按编号查询某一段的交点与方向 |
 | POST | `/api/beam-evaluations` | 扇形采样多条光线逐条追迹，返回各光线发射角、状态、观察线交点及质心/RMS（不入库） |
+| POST | `/api/power-evaluations` | 复用光束采样与追迹，按菲涅耳公式逐界面累乘 s/p 透过率，返回各光线功率与功率加权质心（不入库） |
 | POST | `/api/aim-solutions` | 扫描发射角并对偏差异号区间二分，求解命中观察线目标偏移量的光线（不入库） |
 
 ### 请求示例
@@ -127,6 +128,86 @@ curl -X POST http://localhost:8000/api/beam-evaluations \
 - `rays[]` 按发射角从 `-a` 到 `+a` 排列，每条含 `emission_angle_deg`（相对中心方向的发射角，度）、`direction`（归一化后的实际发射方向）、`status` / `reason`（复用单光线追迹的状态与停止原因）、`observation_point`（观察线前向交点，无效时为 `null`）。
 - 无任何命中时：`hit_count` 为 0，`centroid` 与 `rms_radius` 均为 `null`。
 
+## 功率评估
+
+`POST /api/power-evaluations` 在光束请求（起点、中心方向、折射率、顺序界面、观察线、半角、采样数）基础上增加 `s_fraction`（s 偏振入射功率占比，取值 0～1，p 偏振占 `1 - s_fraction`），复用同一套扇形采样与光线追迹，逐界面按**菲涅耳公式**计算 s/p 偏振的功率反射率与透过率。该接口为即时计算，结果不写入数据库。
+
+- 以光线方向与界面法线求入射角余弦 `cos_i`（光线从法线背面入射时翻转法线），由斯涅尔定律 `sin_t = (n1/n2) sin_i` 求折射角余弦 `cos_t`：
+  - `Rs = [(n1 cos_i - n2 cos_t)/(n1 cos_i + n2 cos_t)]²`
+  - `Rp = [(n2 cos_i - n1 cos_t)/(n2 cos_i + n1 cos_t)]²`
+  - 逐界面累乘**功率透过率** `1 - R`：`Ts = ∏(1 - Rs)`、`Tp = ∏(1 - Rp)`。
+- 每条光线入射功率为 **1**，按占比混合：`power = s_fraction · Ts + (1 - s_fraction) · Tp`。
+- **全反射**（任一束光线追迹状态为 `total_internal_reflection`）或**漏过界面**（`no_intersection`，与界面平行或交点在反方向）时该光线记**零功率**（`Ts = Tp = power = 0`）。
+- 仅**追迹完成且与观察线有前向交点**的光线计入**有效功率**（其 `power` 之和）与**功率加权质心** `Σ(power·point)/Σpower`；追迹完成但观察线无交点的光线有透过率但不计入。
+- `total_input_power` 为总入射功率（等于光线数，每条入射功率为 1）；有效功率为零时 `weighted_centroid` 为 `null`。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/power-evaluations` | 扇形采样、逐条追迹并计算 s/p 菲涅耳透过率、有效功率与功率加权质心 |
+
+### 功率评估请求示例
+
+```bash
+curl -X POST http://localhost:8000/api/power-evaluations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": {"x": 0, "y": 0},
+    "center_direction": {"x": 1, "y": 0},
+    "half_angle_deg": 10,
+    "sample_count": 5,
+    "n_start": 1.0,
+    "interfaces": [
+      {"point": {"x": 2, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.5},
+      {"point": {"x": 4, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.0}
+    ],
+    "observation_line": {"point": {"x": 10, "y": 0}, "normal": {"x": 1, "y": 0}},
+    "s_fraction": 0.5
+  }'
+```
+
+### 功率评估响应说明
+
+```json
+{
+  "half_angle_deg": 10.0,
+  "sample_count": 5,
+  "s_fraction": 0.5,
+  "ray_count": 5,
+  "hit_count": 5,
+  "total_input_power": 5.0,
+  "effective_power": 4.607942624633463,
+  "weighted_centroid": {"x": 10.0, "y": 0.0},
+  "rays": [
+    {
+      "emission_angle_deg": -10.0,
+      "direction": {"x": 0.984807753012208, "y": -0.17364817766693033},
+      "status": "completed",
+      "reason": null,
+      "transmittance_s": 0.918416539493318,
+      "transmittance_p": 0.9247294040133414,
+      "power": 0.9215729717533296,
+      "observation_point": {"x": 10.0, "y": -1.6437139662827691}
+    },
+    {
+      "emission_angle_deg": 0.0,
+      "direction": {"x": 1.0, "y": 0.0},
+      "status": "completed",
+      "reason": null,
+      "transmittance_s": 0.9216,
+      "transmittance_p": 0.9216,
+      "power": 0.9216,
+      "observation_point": {"x": 10.0, "y": 0.0}
+    }
+  ]
+}
+```
+
+- `total_input_power`：总入射功率，恒等于 `ray_count`（每条光线入射功率为 1）。
+- `effective_power`：有效功率，仅累加追迹完成且与观察线有前向交点的光线的 `power`。
+- `weighted_centroid`：有效光线按 `power` 加权的质心；有效功率为 0 时为 `null`。
+- `rays[].transmittance_s` / `transmittance_p`：该光线逐界面累乘的 s/p 总透过率（`0～1`）；全反射或漏过界面时为 `0`；无界面时为 `1`。
+- `rays[].power`：按 `s_fraction` 混合后的该光线功率；`observation_point` 为观察线前向交点，无效时为 `null`。
+
 ## 瞄准求解
 
 `POST /api/aim-solutions` 在光束请求（起点、中心方向、折射率、顺序界面、观察线、半角、采样数）的基础上增加 `target_offset`（目标偏移量），求解使出射光线命中观察线上目标位置的发射角。该接口为即时计算，结果不写入数据库。
@@ -186,7 +267,7 @@ curl -X POST http://localhost:8000/api/aim-solutions \
 ```
 app/
   main.py       FastAPI 路由与生命周期（启动时建库）
-  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS 与瞄准求解（扫描+二分）
+  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、瞄准求解（扫描+二分）
   db.py         SQLite 持久化（traces / segments 两表）
   schemas.py    Pydantic 请求 / 响应模型
 Dockerfile

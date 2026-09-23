@@ -6,6 +6,8 @@ GET  /api/traces/{trace_id}           按编号查询完整追迹（含各段交
 GET  /api/traces/{trace_id}/segments/{seg_index}  按编号查询某一段
 POST /api/beam-evaluations            以中心方向为轴对称采样多条光线，返回每条光线
                                       的发射角、追迹状态、观察线交点及质心/RMS 半径
+POST /api/power-evaluations           复用光束采样与追迹，按菲涅耳公式逐界面累乘
+                                      s/p 透过率，返回各光线功率与功率加权质心
 POST /api/aim-solutions               在半角范围内扫描发射角并对偏差异号区间二分，
                                       求解命中观察线目标偏移量的光线，返回角度、
                                       出射方向、观察线交点与目标偏差（不入库）
@@ -21,14 +23,18 @@ from .geometry import (
     aim_solutions,
     centroid_and_rms,
     observation_intersection,
+    ray_transmittance,
     sample_directions,
     trace_ray,
+    weighted_centroid,
 )
 from .schemas import (
     AimRequest,
     AimSolutionOut,
     BeamEvaluationOut,
     BeamRequest,
+    PowerEvaluationOut,
+    PowerRequest,
     SegmentOut,
     TraceOut,
     TraceRequest,
@@ -150,6 +156,80 @@ def evaluate_beam(req: BeamRequest) -> dict:
         "hit_count": len(hit_points),
         "centroid": None if stats is None else {"x": stats[0][0], "y": stats[0][1]},
         "rms_radius": None if stats is None else stats[1],
+        "rays": rays_out,
+    }
+
+
+@app.post("/api/power-evaluations", response_model=PowerEvaluationOut)
+def evaluate_power(req: PowerRequest) -> dict:
+    """复用光束评估的扇形采样与光线追迹，按菲涅耳公式评估 s/p 偏振透过功率。
+
+    每条光线入射功率为 1，s/p 偏振分别占 s_fraction 与 1 - s_fraction；
+    逐界面由方向与法线求 cos_i、cos_t，按
+        Rs=[(n1 cos_i-n2 cos_t)/(n1 cos_i+n2 cos_t)]²、
+        Rp=[(n2 cos_i-n1 cos_t)/(n2 cos_i+n1 cos_t)]²
+    累乘透过率 1 - R。全反射或漏过界面（追迹未完成）记零功率；仅追迹完成
+    且与观察线有前向交点的光线计入有效功率与功率加权质心，有效功率为零时
+    质心为 null。该接口为即时计算，结果不写入数据库。
+    """
+    interfaces = [
+        (itf.point.as_tuple(), itf.normal.as_tuple(), itf.n_next)
+        for itf in req.interfaces
+    ]
+    start = req.start.as_tuple()
+
+    rays_out: list[dict] = []
+    weighted_hits: list[tuple[tuple[float, float], float]] = []
+    effective_power = 0.0
+    for angle, direction in sample_directions(
+        req.center_direction.as_tuple(), req.half_angle_deg, req.sample_count
+    ):
+        segments, status, reason = trace_ray(
+            start, direction, req.n_start, interfaces
+        )
+        t_s, t_p = ray_transmittance(segments, status, interfaces)
+        power = req.s_fraction * t_s + (1.0 - req.s_fraction) * t_p
+
+        observation_point = None
+        if status == "completed":
+            observation_point = observation_intersection(
+                segments,
+                req.observation_line.point.as_tuple(),
+                req.observation_line.normal.as_tuple(),
+            )
+            if observation_point is not None:
+                effective_power += power
+                weighted_hits.append((observation_point, power))
+
+        rays_out.append(
+            {
+                "emission_angle_deg": angle,
+                "direction": {"x": direction[0], "y": direction[1]},
+                "status": status,
+                "reason": reason,
+                "transmittance_s": t_s,
+                "transmittance_p": t_p,
+                "power": power,
+                "observation_point": (
+                    None
+                    if observation_point is None
+                    else {"x": observation_point[0], "y": observation_point[1]}
+                ),
+            }
+        )
+
+    centroid = weighted_centroid(weighted_hits)
+    return {
+        "half_angle_deg": req.half_angle_deg,
+        "sample_count": req.sample_count,
+        "s_fraction": req.s_fraction,
+        "ray_count": len(rays_out),
+        "hit_count": len(weighted_hits),
+        "total_input_power": float(len(rays_out)),
+        "effective_power": effective_power,
+        "weighted_centroid": (
+            None if centroid is None else {"x": centroid[0], "y": centroid[1]}
+        ),
         "rays": rays_out,
     }
 
